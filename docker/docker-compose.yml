@@ -1,0 +1,267 @@
+# Shared defaults anchor reused by all services to keep ops behavior consistent.
+x-defaults: &defaults
+  # Automatically restart containers after crashes or daemon restarts (except manual stop).
+  restart: unless-stopped
+  # Enable tini-like init process for proper signal handling and zombie reaping.
+  init: true
+  # Attach every service to the same internal network for DNS-based service discovery.
+  networks:
+    # Custom bridge network keeps inter-service traffic isolated from other stacks.
+    - data-platform
+  # Configure log driver settings once so all services rotate logs predictably.
+  logging:
+    # JSON log driver is default and integrates with Docker tooling/collectors.
+    driver: json-file
+    # Rotation options prevent unbounded disk growth from container logs.
+    options:
+      # Rotate log file after 10MB to limit single-file size and IO hotspots.
+      max-size: "10m"
+      # Keep the latest 5 rotated files to retain recent history without filling disk.
+      max-file: "5"
+
+# Shared Hadoop env anchor to keep NameNode and DataNode on the exact same HDFS settings.
+x-hadoop-env: &hadoop-env
+  # Set the default Hadoop filesystem URI so clients resolve to the intended NameNode RPC endpoint.
+  CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+  # Force NameNode RPC bind/advertise address to a stable service name and port.
+  HDFS_CONF_dfs_namenode_rpc___address: namenode:9000
+  # Disable strict hostname/IP registration checks to avoid container-network mismatch issues.
+  HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
+
+# Root services block defining every container in this platform stack.
+services:
+
+  ########################
+  # ZOOKEEPER
+  ########################
+  # ZooKeeper provides Kafka metadata coordination in this deployment mode.
+  zookeeper:
+    # Merge shared defaults to enforce restart/logging/network standards.
+    <<: *defaults
+    # Pin image/version for deterministic builds and fewer surprise regressions.
+    image: confluentinc/cp-zookeeper:7.6.1
+    # ZooKeeper runtime configuration values.
+    environment:
+      # Expose client coordination port used by Kafka.
+      ZOOKEEPER_CLIENT_PORT: 2181
+      # Set ZooKeeper tick interval; controls session/heartbeat timing internals.
+      ZOOKEEPER_TICK_TIME: 2000
+    # Host-to-container port mapping for local access and diagnostics.
+    ports:
+      # Publish ZooKeeper client port to the host for external tools.
+      - "2181:2181"
+    # Healthcheck helps detect dead-but-running process states.
+    healthcheck:
+      # Probe TCP socket directly to verify listener readiness, not just process existence.
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/2181"]
+      # Run health probe every 30 seconds to balance sensitivity and overhead.
+      interval: 30s
+      # Fail a single probe after 10 seconds to avoid hanging checks.
+      timeout: 10s
+      # Require 10 failed checks before marking unhealthy to reduce false positives at startup.
+      retries: 10
+      # Allow 60 seconds warm-up before health status starts counting as failures.
+      start_period: 60s
+    # Cap memory to protect host stability under abnormal load.
+    mem_limit: 512m
+
+  # Visual separator for the Kafka service section.
+  ########################
+  # Service title for readability during maintenance.
+  # KAFKA
+  # Visual separator for the Kafka service section.
+  ########################
+  # Kafka broker for streaming event ingestion and durable messaging.
+  kafka:
+    # Merge shared defaults to enforce restart/logging/network standards.
+    <<: *defaults
+    # Use ZooKeeper-compatible Kafka distribution to match this architecture.
+    image: confluentinc/cp-kafka:7.6.1
+    # Startup order hint so ZooKeeper is started before Kafka.
+    depends_on:
+      # Kafka needs ZooKeeper endpoint available during broker boot.
+      - zookeeper
+    # Host-to-container port mappings for clients outside Docker network.
+    ports:
+      # Publish broker listener for producers/consumers and app integrations.
+      - "9092:9092"
+    # Broker configuration for networking and single-node metadata topics.
+    environment:
+      # Static broker ID is required for broker identity in cluster metadata.
+      KAFKA_BROKER_ID: 1
+      # Point broker to ZooKeeper ensemble (single node here) for metadata management.
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Bind broker listener on all interfaces inside the container.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      # Advertise Docker DNS hostname so other services resolve the broker correctly.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      # Define listener security protocol mapping to satisfy broker startup requirements.
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      # Set internal broker-to-broker channel listener.
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single-broker deployment requires replication factor 1 for offsets topic.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # Single-broker deployment requires replication factor 1 for txn state log.
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      # Minimum in-sync replicas set to 1 so writes succeed with one broker.
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    # Healthcheck ensures socket is accepting connections before considering service healthy.
+    healthcheck:
+      # Probe Kafka listener TCP port directly.
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/9092"]
+      # Probe cadence for reasonable fault detection speed.
+      interval: 30s
+      # Timeout to avoid hanging healthcheck shell processes.
+      timeout: 10s
+      # More retries absorb broker startup lag and metadata initialization time.
+      retries: 12
+      # Longer startup grace because Kafka often needs extra initialization time.
+      start_period: 90s
+    # Cap broker memory to avoid host exhaustion.
+    mem_limit: 1g
+
+  # Visual separator for the Hadoop NameNode service section.
+  ########################
+  # Service title for readability during maintenance.
+  # HADOOP NAMENODE
+  # Visual separator for the Hadoop NameNode service section.
+  ########################
+  # NameNode manages HDFS metadata and namespace operations.
+  namenode:
+    # Merge shared defaults to enforce restart/logging/network standards.
+    <<: *defaults
+    # Pin NameNode image to a known-compatible Hadoop/JDK combination.
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    # NameNode environment values including shared HDFS core settings.
+    environment:
+      # Merge shared Hadoop configuration so NameNode/DataNode stay aligned.
+      <<: *hadoop-env
+      # Logical cluster name used by container init scripts and metadata layout.
+      CLUSTER_NAME: aerostream
+    # Publish NameNode UI and RPC ports for observability and external clients.
+    ports:
+      # NameNode web UI for health/status and filesystem inspection.
+      - "9870:9870"
+      # NameNode RPC endpoint for DataNode registration and HDFS client operations.
+      - "9000:9000"
+    # Persist NameNode metadata so restarts do not lose HDFS namespace state.
+    volumes:
+      # Named volume stores /hadoop/dfs/name outside container lifecycle.
+      - namenode:/hadoop/dfs/name
+    # Healthcheck validates both UI and critical RPC endpoint availability.
+    healthcheck:
+      # Require both ports up to reduce false healthy states.
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/9870 && exec 4<>/dev/tcp/127.0.0.1/9000"]
+      # Probe cadence for readiness/liveness monitoring.
+      interval: 30s
+      # Per-check timeout to avoid hanging probe executions.
+      timeout: 10s
+      # Higher retry count because NameNode can take longer to fully initialize.
+      retries: 20
+      # Longer warm-up window to avoid premature unhealthy marking.
+      start_period: 120s
+    # Memory guardrail for predictable host resource usage.
+    mem_limit: 1g
+
+  # Visual separator for the Hadoop DataNode service section.
+  ########################
+  # Service title for readability during maintenance.
+  # HADOOP DATANODE
+  # Visual separator for the Hadoop DataNode service section.
+  ########################
+  # DataNode stores HDFS blocks and serves read/write data traffic.
+  datanode:
+    # Merge shared defaults to enforce restart/logging/network standards.
+    <<: *defaults
+    # Pin DataNode image to version compatible with NameNode image.
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    # Startup ordering hint so NameNode starts before DataNode bootstrap.
+    depends_on:
+      # DataNode registration requires NameNode endpoint to be available.
+      - namenode
+    # DataNode runtime env configuration.
+    environment:
+      # Merge shared Hadoop configuration so RPC/filesystem settings match NameNode.
+      <<: *hadoop-env
+      # Wait for NameNode UI and RPC sockets before DataNode startup script proceeds.
+      SERVICE_PRECONDITION: namenode:9870 namenode:9000
+    # Persist DataNode block storage across container restarts.
+    volumes:
+      # Named volume stores HDFS data blocks outside container lifecycle.
+      - datanode:/hadoop/dfs/data
+    # More memory for block operations and JVM overhead.
+    mem_limit: 2g
+
+  # Visual separator for the Spark master service section.
+  ########################
+  # Service title for readability during maintenance.
+  # SPARK MASTER
+  # Visual separator for the Spark master service section.
+  ########################
+  # Spark master coordinates cluster resources and schedules worker tasks.
+  spark-master:
+    # Merge shared defaults to enforce restart/logging/network standards.
+    <<: *defaults
+    # Use official Apache Spark image for broad availability.
+    image: apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
+    # Explicit command ensures container runs long-lived Spark master process.
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    # Publish Spark UI and cluster RPC ports.
+    ports:
+      # Spark master web UI for monitoring executors/jobs.
+      - "8080:8080"
+      # Spark master RPC endpoint workers connect to.
+      - "7077:7077"
+    # Healthcheck confirms Spark master RPC socket is listening.
+    healthcheck:
+      # TCP probe verifies master is accepting worker connections.
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/7077"]
+      # Probe cadence for fast enough detection without excess overhead.
+      interval: 30s
+      # Timeout avoids lingering probe shells.
+      timeout: 10s
+      # Retries absorb JVM and Spark startup time.
+      retries: 12
+      # Startup grace to prevent early unhealthy status.
+      start_period: 90s
+    # Memory cap to prevent Spark master from starving co-located services.
+    mem_limit: 2g
+
+  # Visual separator for the Spark worker service section.
+  ########################
+  # Service title for readability during maintenance.
+  # SPARK WORKER
+  # Visual separator for the Spark worker service section.
+  ########################
+  # Spark worker executes tasks assigned by the Spark master.
+  spark-worker:
+    # Merge shared defaults to enforce restart/logging/network standards.
+    <<: *defaults
+    # Use official Apache Spark image to match master runtime.
+    image: apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
+    # Startup order hint so worker starts after master container creation.
+    depends_on:
+      # Worker requires master endpoint configured and reachable.
+      - spark-master
+    # Explicit command keeps worker process in foreground and connected to master.
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "1", "--memory", "1g"]
+    # Memory cap aligned with worker CLI memory assignment.
+    mem_limit: 2g
+
+# Define named volumes for persistent stateful service data.
+volumes:
+  # Named volume declaration for NameNode metadata persistence.
+  namenode:
+    # Local volume driver stores data on Docker host filesystem.
+    driver: local
+  # Named volume declaration for DataNode block storage persistence.
+  datanode:
+    # Local volume driver stores data on Docker host filesystem.
+    driver: local
+
+# Define custom network used by all services in this compose stack.
+networks:
+  # Network name used by service DNS resolution and traffic isolation.
+  data-platform:
+    # Bridge driver provides container-to-container communication on one host.
+    driver: bridge
