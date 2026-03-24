@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker
+*.log
+docker-compose.override.yml
+.env.local
+.env.production
+
+# Data
+data/
+logs/
+spark-apps/
+!spark-apps/.gitkeep
+*.parquet
+*.csv
+*.json
+
+# GCP credentials
+gcp-credentials.json
+*.key
+*.pem
+
+# Airflow
+airflow.cfg
+airflow.db
+webserver_config.py
+
+# HDFS
+namenode/
+datanode/
+
+# Kafka
+kafka-data/
+zookeeper-data/
+
+# Superset
+superset_home/
+
+# Monitoring
+prometheus-data/
+grafana-data/
+
+# Temporary files
+tmp/
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
