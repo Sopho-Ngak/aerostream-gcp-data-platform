@@ -19,7 +19,7 @@ x-hadoop-env: &hadoop-env
 x-airflow-common: &airflow-common
   image: apache/airflow:3.0.0-python3.11
   environment: &airflow-common-env
-    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
@@ -28,6 +28,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__RBAC: 'true'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__CELERY__BROKER_URL: 'redis://redis:6379/0'
+    AIRFLOW__CELERY__RESULT_BACKEND: 'db+postgresql://airflow:airflow@airflow-postgres/airflow'
     # Add GCP and other env vars
     GCP_PROJECT_ID: ${GCP_PROJECT_ID}
     GCS_BUCKET_NAME: ${GCS_BUCKET_NAME}
@@ -42,6 +44,8 @@ x-airflow-common: &airflow-common
     - /var/run/docker.sock:/var/run/docker.sock
   depends_on:
     airflow-postgres:
+      condition: service_healthy
+    redis:
       condition: service_healthy
   user: "${AIRFLOW_UID:-50000}:0"
   env_file:
@@ -205,6 +209,20 @@ services:
       - ./config/spark:/opt/spark/conf
     mem_limit: 1g
 
+  # ==================== REDIS (for Airflow Celery) ====================
+  redis:
+    <<: *defaults
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    mem_limit: 256m
+
   # ==================== INGESTION SERVICE ====================
   ingestion:
     <<: *defaults
@@ -242,38 +260,6 @@ services:
       retries: 5
     mem_limit: 512m
 
-  airflow-webserver:
-    <<: [*defaults, *airflow-common]
-    container_name: airflow-webserver
-    ports:
-      - "8082:8080"
-    command: webserver
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    mem_limit: 1g
-
-  airflow-scheduler:
-    <<: [*defaults, *airflow-common]
-    container_name: airflow-scheduler
-    command: scheduler
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    mem_limit: 1g
-
-  airflow-triggerer:
-    <<: [*defaults, *airflow-common]
-    container_name: airflow-triggerer
-    command: triggerer
-    mem_limit: 512m
-
   airflow-init:
     <<: [*defaults, *airflow-common]
     container_name: airflow-init
@@ -284,31 +270,64 @@ services:
         airflow db migrate
         airflow users create \
           --username admin \
-          --firstname admin \
-          --lastname admin \
+          --firstname Admin \
+          --lastname User \
           --role Admin \
           --email admin@example.com \
-          --password admin
+          --password admin || true
         airflow connections add 'spark_default' \
           --conn-type 'spark' \
           --conn-host 'spark://spark-master' \
-          --conn-port '7077'
+          --conn-port '7077' || true
         airflow connections add 'hdfs_default' \
           --conn-type 'hdfs' \
           --conn-host 'hdfs://namenode' \
-          --conn-port '9000'
+          --conn-port '9000' || true
+        echo "Airflow 3 initialization complete!"
     mem_limit: 512m
+
+  airflow-scheduler:
+    <<: [*defaults, *airflow-common]
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "scheduler", "--help"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_limit: 1g
+
+  airflow-api-server:
+    <<: [*defaults, *airflow-common]
+    container_name: airflow-api-server
+    command: api-server
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_limit: 1g
 
   airflow-worker:
     <<: [*defaults, *airflow-common]
     container_name: airflow-worker
-    command: celery worker
+    command: worker
     mem_limit: 1g
+
+  airflow-triggerer:
+    <<: [*defaults, *airflow-common]
+    container_name: airflow-triggerer
+    command: triggerer
+    mem_limit: 512m
 
   airflow-flower:
     <<: [*defaults, *airflow-common]
     container_name: airflow-flower
-    command: celery flower
+    command: flower
     ports:
       - "5555:5555"
     mem_limit: 512m
@@ -391,13 +410,11 @@ services:
         condition: service_healthy
       namenode:
         condition: service_healthy
-      datanode:
-        condition: service_healthy
       spark-master:
         condition: service_healthy
       airflow-postgres:
         condition: service_healthy
-      airflow-webserver:
+      airflow-api-server:
         condition: service_healthy
     command: >
       sh -c "

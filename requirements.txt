@@ -2,3 +2,31 @@ google-cloud-bigquery==3.40.1
 google-cloud-storage==3.9.0
 kafka-python==2.3.0
 requests==2.32.5
+
+
+# Core
+apache-airflow==3.0.0
+pyspark
+
+
+# Spark integration
+apache-airflow-providers-apache-spark
+apache-airflow-providers-google
+apache-airflow-providers-apache-spark
+apache-airflow-providers-postgres
+
+# Data processing
+pandas
+numpy
+pyarrow
+
+# Utils
+python-dotenv
+pyyaml
+
+# Testing
+pytest
+pytest-cov
+
+# Monitoring
+prometheus-client
