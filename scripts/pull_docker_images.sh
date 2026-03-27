@@ -1,0 +1,10 @@
+docker pull confluentinc/cp-zookeeper:7.6.1
+docker pull confluentinc/cp-kafka:7.6.1
+docker pull provectuslabs/kafka-ui:latest
+docker pull bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+docker pull bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+docker pull apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
+docker pull apache/superset:latest
+docker pull prom/prometheus:latest
+docker pull grafana/grafana:latest
+docker pull redis:7-alpine

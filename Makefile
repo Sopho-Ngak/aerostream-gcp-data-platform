@@ -1,3 +1,4 @@
+SHELL := /bin/bash
 .PHONY: help setup up down restart logs clean test init-hdfs airflow-init
 
 help:
@@ -19,18 +20,18 @@ setup:
 	@mkdir -p config/{airflow,hadoop,spark,prometheus}
 	@mkdir -p dags src scripts
 	@chmod +x scripts/*.sh scripts/*.py
+	@. scripts/pull_docker_images.sh
 	@echo "✅ Setup complete"
 
 up:
 	@echo "🚀 Starting all services..."
-	@docker-compose up -d
+	@docker compose up -d
 	@echo "✅ Services started"
 	@sleep 10
 	@echo ""
 	@echo "Access URLs:"
 	@echo "  Spark Master: http://localhost:8080"
 	@echo "  Airflow 3 API Server: http://localhost:8082"
-	@echo "  Airflow Flower: http://localhost:5555"
 	@echo "  Superset: http://localhost:8088"
 	@echo "  Kafka UI: http://localhost:8083"
 	@echo "  Hadoop NameNode: http://localhost:9870"
@@ -41,17 +42,17 @@ up:
 
 down:
 	@echo "🛑 Stopping all services..."
-	@docker-compose down
+	@docker compose down
 	@echo "✅ Services stopped"
 
 restart: down up
 
 logs:
-	@docker-compose logs -f --tail=100
+	@docker compose logs -f --tail=100
 
 clean:
 	@echo "🧹 Cleaning up..."
-	@docker-compose down -v
+	@docker compose down -v
 	@docker system prune -f
 	@rm -rf logs/* data/* 2>/dev/null || true
 	@echo "✅ Cleanup complete"
@@ -68,34 +69,34 @@ init-hdfs:
 
 airflow-init:
 	@echo "🚀 Initializing Airflow 3..."
-	@docker-compose up -d airflow-postgres redis
+	@docker compose up -d airflow-postgres redis
 	@sleep 5
-	@docker-compose run --rm airflow-init
+	@docker compose run --rm airflow-init
 	@echo "✅ Airflow 3 initialized"
 	@echo "   Access Airflow API Server at http://localhost:8082"
 	@echo "   Credentials: admin / admin"
 
 # Development helpers
 dev-shell:
-	@docker-compose exec ingestion /bin/bash
+	@docker compose exec ingestion /bin/bash
 
 spark-shell:
-	@docker-compose exec spark-master /opt/spark/bin/spark-shell
+	@docker compose exec spark-master /opt/spark/bin/spark-shell
 
 pyspark:
-	@docker-compose exec spark-master /opt/spark/bin/pyspark
+	@docker compose exec spark-master /opt/spark/bin/pyspark
 
 kafka-produce:
-	@docker-compose exec ingestion python /app/ingestion/producer.py
+	@docker compose exec ingestion python /app/ingestion/producer.py
 
 airflow-shell:
-	@docker-compose exec airflow-api-server /bin/bash
+	@docker compose exec airflow-api-server /bin/bash
 
 airflow-dags:
-	@docker-compose exec airflow-api-server airflow dags list
+	@docker compose exec airflow-api-server airflow dags list
 
 airflow-unpause:
-	@docker-compose exec airflow-api-server airflow dags unpause aerostream_flight_pipeline_v3
+	@docker compose exec airflow-api-server airflow dags unpause aerostream_flight_pipeline_v3
 
 airflow-connections:
-	@docker-compose exec airflow-api-server airflow connections list
+	@docker compose exec airflow-api-server airflow connections list

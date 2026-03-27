@@ -17,22 +17,29 @@ x-hadoop-env: &hadoop-env
 
 # Airflow 3 specific common environment
 x-airflow-common: &airflow-common
-  image: apache/airflow:3.0.0-python3.11
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.airflow
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager"
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'true'
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__FERNET_KEY: 'd6Vefz3G9U_5XB3kslRI0M6lCJj0jJOkZkzYJpFqE6s='
     AIRFLOW__WEBSERVER__SECRET_KEY: 'supersecretkey12345678901234567890'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__API__SECRET_KEY: 'supersecretkey12345678901234567890'
     AIRFLOW__WEBSERVER__RBAC: 'true'
-    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__WEBSERVER__BASE_URL: 'http://localhost:8082'
     AIRFLOW__CELERY__BROKER_URL: 'redis://redis:6379/0'
     AIRFLOW__CELERY__RESULT_BACKEND: 'db+postgresql://airflow:airflow@airflow-postgres/airflow'
     # Add GCP and other env vars
     GCP_PROJECT_ID: ${GCP_PROJECT_ID}
     GCS_BUCKET_NAME: ${GCS_BUCKET_NAME}
+    BIGQUERY_DATASET: ${BIGQUERY_DATASET}
+    PYTHONPATH: /opt/airflow/src
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
@@ -251,6 +258,8 @@ services:
       - POSTGRES_USER=airflow
       - POSTGRES_PASSWORD=airflow
       - POSTGRES_DB=airflow
+    ports:
+      - "5432:5432"
     volumes:
       - airflow-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -258,7 +267,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-    mem_limit: 512m
+    # mem_limit: 512m
 
   airflow-init:
     <<: [*defaults, *airflow-common]
@@ -267,7 +276,13 @@ services:
     command:
       - -c
       - |
+        echo "Waiting for PostgreSQL..."
+        sleep 5
+        
+        echo "Running database migrations..."
         airflow db migrate
+
+        echo "Creating admin user..."
         airflow users create \
           --username admin \
           --firstname Admin \
@@ -284,7 +299,7 @@ services:
           --conn-host 'hdfs://namenode' \
           --conn-port '9000' || true
         echo "Airflow 3 initialization complete!"
-    mem_limit: 512m
+    # mem_limit: 512m
 
   airflow-scheduler:
     <<: [*defaults, *airflow-common]
@@ -305,57 +320,26 @@ services:
     ports:
       - "8082:8080"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
-    mem_limit: 1g
+    # mem_limit: 1g
 
-  airflow-worker:
-    <<: [*defaults, *airflow-common]
-    container_name: airflow-worker
-    command: worker
-    mem_limit: 1g
+  # airflow-worker:
+  #   <<: [*defaults, *airflow-common]
+  #   container_name: airflow-worker
+  #   command: celery worker
+  #   mem_limit: 1g
 
-  airflow-triggerer:
-    <<: [*defaults, *airflow-common]
-    container_name: airflow-triggerer
-    command: triggerer
-    mem_limit: 512m
-
-  airflow-flower:
-    <<: [*defaults, *airflow-common]
-    container_name: airflow-flower
-    command: flower
-    ports:
-      - "5555:5555"
-    mem_limit: 512m
+  # airflow-triggerer:
+  #   <<: [*defaults, *airflow-common]
+  #   container_name: airflow-triggerer
+  #   command: triggerer
+  #   mem_limit: 512m
 
   # ==================== SUPERSET ====================
-  superset:
-    <<: *defaults
-    image: apache/superset:latest
-    container_name: superset
-    environment:
-      - SUPERSET_SECRET_KEY=your_secret_key_here_change_me_123456789
-      - SUPERSET__SQLALCHEMY_DATABASE_URI=postgresql+psycopg2://superset:superset@superset-db/superset
-    ports:
-      - "8088:8088"
-    depends_on:
-      - superset-db
-    volumes:
-      - ./dashboard/superset_config.py:/app/pythonpath/superset_config.py
-      - ./data/superset:/app/superset_home
-    command: >
-      sh -c "
-        superset fab create-admin &&
-        superset db upgrade &&
-        superset init &&
-        superset run -p 8088 --with-threads --reload --debugger
-      "
-    mem_limit: 1g
-
   superset-db:
     <<: *defaults
     image: postgres:15
@@ -365,8 +349,49 @@ services:
       - POSTGRES_PASSWORD=superset
       - POSTGRES_DB=superset
     volumes:
-      - superset-db:/var/lib/postgresql/data
+      - superset-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "superset"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - data-platform
     mem_limit: 512m
+
+  superset:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.superset
+    container_name: superset
+    environment:
+      - SUPERSET__SQLALCHEMY_DATABASE_URI=postgresql://superset:superset@superset-db:5432/superset
+      - SUPERSET_SECRET_KEY=your_secret_key_here_change_me_123456789
+      # - PYTHONPATH=/app/pythonpath
+    volumes:
+      - ./config/superset/superset_config.py:/app/pythonpath/superset_config.py
+      - ./data/superset:/app/superset_home
+      - ./dashboard:/app/dashboard
+    command:
+      - -c
+      - |
+        echo 'Initializing Superset database...' &&
+        pip install psycopg2-binary &&
+        superset db upgrade &&
+        superset init &&
+        echo 'Creating admin user...' &&
+        superset fab create-admin --username admin --firstname Admin --lastname User --email admin@example.com --password admin &&
+        gunicorn -b 0.0.0.0:8088 -w 2 --timeout 300 'superset.app:create_app()'
+    ports:
+      - "8088:8088"
+    depends_on:
+      superset-db:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    # entrypoint: ["/bin/bash", "/superset_init.sh"]
+    networks:
+      - data-platform
+    mem_limit: 1g
 
   # ==================== MONITORING ====================
   prometheus:
@@ -410,8 +435,8 @@ services:
         condition: service_healthy
       namenode:
         condition: service_healthy
-      spark-master:
-        condition: service_healthy
+      # spark-master:
+      #   condition: service_healthy
       airflow-postgres:
         condition: service_healthy
       airflow-api-server:
@@ -450,6 +475,9 @@ volumes:
   prometheus-data:
     driver: local
   grafana-data:
+    driver: local
+
+  superset-db-data:
     driver: local
 
 # ==================== NETWORKS ====================

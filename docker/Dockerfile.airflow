@@ -1,0 +1,54 @@
+FROM apache/airflow:3.0.0-python3.11
+
+# Switch to root to install system packages
+USER root
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        netcat-openbsd \
+        gcc \
+        g++ \
+        && rm -rf /var/lib/apt/lists/*
+
+RUN chmod -R 755 /opt/airflow/dags/ && \
+    chown -R airflow:root /opt/airflow/dags/
+
+# Switch back to airflow user
+USER airflow
+
+# Install required providers
+RUN pip install --no-cache-dir \
+    apache-airflow-providers-fab==3.5.0 \
+    apache-airflow-providers-google==20.0.0 \
+    apache-airflow-providers-apache-spark==5.6.0 \
+    apache-airflow-providers-postgres==6.6.1 \
+    apache-airflow-providers-redis==4.4.2 \
+    google-cloud-storage==3.9.0 \
+    google-cloud-bigquery==3.40.1 \
+    kubernetes \
+    python-dotenv
+
+# Set environment variables
+ENV AIRFLOW__CORE__LOAD_EXAMPLES=False
+ENV AIRFLOW__WEBSERVER__RBAC=True
+ENV AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
+ENV AIRFLOW__CORE__AUTH_MANAGER="airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager"
+ENV AIRFLOW__WEBSERVER__COOKIE_SAMESITE="None"
+
+# # Copy entrypoint script
+# COPY ./scripts/airflow_entrypoint.sh  /entrypoint.sh
+# USER root
+# RUN chmod +x /entrypoint.sh
+# USER airflow
+
+# ENTRYPOINT ["/entrypoint.sh"]
+
+
+
+# Create directories
+RUN mkdir -p /opt/airflow/dags /opt/airflow/logs /opt/airflow/config
+
+# Copy custom config if exists
+COPY config/airflow/airflow.cfg /opt/airflow/airflow.cfg
+
+WORKDIR /opt/airflow

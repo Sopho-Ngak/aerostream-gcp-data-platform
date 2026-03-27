@@ -1,8 +1,3 @@
-"""
-AeroStream Flight Data Pipeline DAG for Airflow 3
-Complete pipeline from ingestion to dashboard
-"""
-
 from airflow.decorators import dag, task
 from airflow.models import Variable
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
