@@ -13,15 +13,21 @@ import os
 
 # Default arguments
 default_args = {
-    'owner': 'aerostream',
-    'depends_on_past': False,
-    'email_on_failure': True,
-    'email_on_retry': False,
-    'email': ['admin@example.com'],
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-    'execution_timeout': timedelta(hours=2),
-    'start_date': datetime(2024, 1, 1),
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+    # 'queue': 'bash_queue',
+    # 'pool': 'backfill',
+    # 'priority_weight': 10,
+    # 'end_date': datetime(2016, 1, 1),
+    # 'wait_for_downstream': False,
+    # 'execution_timeout': timedelta(seconds=300),
+    # 'on_failure_callback': some_function, # or list of functions
+    # 'on_success_callback': some_other_function, # or list of functions
+    # 'on_retry_callback': another_function, # or list of functions
+    # 'sla_miss_callback': yet_another_function, # or list of functions
+    # 'on_skipped_callback': another_function, #or list of functions
+    # 'trigger_rule': 'all_success'
 }
 
 # Environment variables
@@ -36,9 +42,9 @@ BQ_DATASET = os.getenv('BIGQUERY_DATASET', 'aviation')
     description='Complete flight data pipeline from ingestion to dashboard (Airflow 3)',
     schedule='0 */2 * * *',  # Every 2 hours
     catchup=False,
+    start_date=datetime(2021, 1, 1),
     tags=['aerostream', 'flight-data', 'production', 'airflow3'],
     max_active_runs=1,
-    concurrency=10,
 )
 def aerostream_pipeline():
     """
