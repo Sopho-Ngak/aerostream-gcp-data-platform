@@ -34,6 +34,7 @@ df = spark \
     .readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "kafka:9092") \
+    .option("kafka.group.id", "aviation-stream-consumer") \
     .option("subscribe", "aviation_flights") \
     .option("startingOffsets", "latest") \
     .option("failOnDataLoss", "false") \

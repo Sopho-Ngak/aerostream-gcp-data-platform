@@ -16,10 +16,15 @@ x-hadoop-env: &hadoop-env
   HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
 
 x-spark-common: &spark-common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.spark
   environment: &spark-common-env
     HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
     SPARK_IVY_HOME: /tmp/.ivy2
     SPARK_HOME: /opt/spark
+    PYSPARK_PYTHON: python3.11
+    PYSPARK_DRIVER_PYTHON: python3.11
   volumes: &spark-common-volumes
     - ./src:/opt/spark/work-dir/src
     - ./spark-apps:/opt/spark-apps
@@ -63,6 +68,9 @@ x-airflow-common: &airflow-common
     GCP_PROJECT_ID: ${GCP_PROJECT_ID}
     GCS_BUCKET_NAME: ${GCS_BUCKET_NAME}
     BIGQUERY_DATASET: ${BIGQUERY_DATASET}
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/config/gcp/gcp-credentials.json
+    # SparkSubmitHook uses --master from this connection; conf spark.master alone does not override it.
+    AIRFLOW_CONN_SPARK_DEFAULT: 'spark://spark-master:7077'
     PYTHONPATH: /opt/airflow/src
     
   user: "${AIRFLOW_UID}:0"
@@ -78,7 +86,9 @@ x-airflow-common: &airflow-common
     # - ./spark-apps:/opt/airflow/spark-apps
     # - /var/run/docker.sock:/var/run/docker.sock
     - ./config:/opt/airflow/config
+    - ./config/gcp:/opt/airflow/config/gcp:ro
     - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
     - ./data:/opt/airflow/data
     - ./include:/opt/airflow/include
     - ./logs:/opt/airflow/logs
@@ -192,10 +202,27 @@ services:
       - datanode:/hadoop/dfs/data
     mem_limit: 2g
 
+  # One-shot initializer: create required HDFS folders on startup.
+  hdfs-init:
+    <<: *defaults
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs-init
+    restart: "no"
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_started
+    environment:
+      <<: *hadoop-env
+      HADOOP_USER_NAME: root
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/bash", "/scripts/init_hdfs_dirs.sh"]
+
   # ==================== SPARK STACK ====================
   spark-master:
     <<: [*defaults, *spark-common]
-    image: apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
     container_name: spark-master
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
     ports:
@@ -214,7 +241,6 @@ services:
 
   spark-worker:
     <<: [*defaults, *spark-common]  
-    image: apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
     container_name: spark-worker
     depends_on:
       - spark-master
@@ -228,8 +254,10 @@ services:
 
   spark-history:
     <<: [*defaults, *spark-common]
-    image: apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
     container_name: spark-history
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.history.HistoryServer"]
     ports:
       - "18080:18080"
@@ -263,6 +291,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      hdfs-init:
+        condition: service_completed_successfully
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - PYTHONUNBUFFERED=1
@@ -271,6 +301,33 @@ services:
     volumes:
       - ./src:/app/src
       - ./logs:/app/logs
+
+  # ==================== STREAMING CONSUMER ====================
+  streaming:
+    <<: [*defaults, *spark-common]
+    container_name: streaming
+    depends_on:
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+      hdfs-init:
+        condition: service_completed_successfully
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - --conf
+      - spark.pyspark.python=python3.11
+      - --conf
+      - spark.pyspark.driver.python=python3.11
+      - /opt/spark/work-dir/src/streaming/stream_flights.py
+    environment:
+      <<: *spark-common-env
+    volumes: *spark-common-volumes
+    mem_limit: 2g
 
   # ==================== AIRFLOW 3 STACK ====================
   airflow-postgres:
@@ -454,6 +511,12 @@ services:
     depends_on:
       airflow-init:
         condition: service_completed_successfully
+      hdfs-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
       # airflow-scheduler:
       #   condition: service_completed_successfully
 

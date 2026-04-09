@@ -1,11 +1,11 @@
-from airflow.decorators import dag, task
 from airflow.models import Variable
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
 from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
 from airflow.providers.google.cloud.operators.gcs import GCSListObjectsOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.task.trigger_rule import TriggerRule
+from airflow.sdk import dag, task
 
 from datetime import datetime, timedelta
 import logging
@@ -82,6 +82,8 @@ def aerostream_pipeline():
             'spark.master': 'spark://spark-master:7077',
             'spark.executor.memory': '2g',
             'spark.driver.memory': '2g',
+            'spark.pyspark.python': 'python3.11',
+            'spark.pyspark.driver.python': 'python3.11',
             'spark.sql.adaptive.enabled': 'true',
             'spark.sql.adaptive.coalescePartitions.enabled': 'true',
         },
@@ -99,38 +101,60 @@ def aerostream_pipeline():
     )
     def export_to_gcs(**context):
         """Export processed data from HDFS to GCS"""
-        import subprocess
-        import tempfile
-        
+        import requests
+        from google.cloud import storage
+
         execution_date = context['ds']
-        tmp_dir = tempfile.mkdtemp()
-        
+        hdfs_dir = f"/tmp/aviation/processed/flight_metrics/ingestion_date={execution_date}"
+        gcs_path = f"flight_metrics/ingestion_date={execution_date}"
+        webhdfs_base = "http://namenode:9870/webhdfs/v1"
+        list_url = f"{webhdfs_base}{hdfs_dir}"
+
         try:
-            # Copy from HDFS to local via docker exec
-            subprocess.run([
-                'docker', 'exec', 'namenode', 'hdfs', 'dfs', '-copyToLocal',
-                f'/aviation/processed/flight_metrics/ingestion_date={execution_date}',
-                f'/tmp/{execution_date}'
-            ], check=True, capture_output=True)
-            
-            # Upload to GCS
-            gcs_path = f"flight_metrics/ingestion_date={execution_date}"
-            subprocess.run([
-                'gsutil', '-m', 'cp', '-r',
-                f'/tmp/{execution_date}/*',
-                f'gs://{GCS_BUCKET}/{gcs_path}/'
-            ], check=True, capture_output=True)
-            
+            # List files from HDFS using WebHDFS.
+            logging.info("Listing files in HDFS path: %s", hdfs_dir)
+            list_resp = requests.get(
+                list_url,
+                params={"op": "LISTSTATUS", "user.name": "root"},
+                timeout=30,
+            )
+            list_resp.raise_for_status()
+            statuses = list_resp.json()["FileStatuses"]["FileStatus"]
+            parquet_files = [s["pathSuffix"] for s in statuses if s["type"] == "FILE" and s["pathSuffix"].endswith(".parquet")]
+
+            if not parquet_files:
+                raise ValueError(f"No parquet files found in HDFS path: {hdfs_dir}")
+
+            storage_client = storage.Client(project=GCP_PROJECT_ID)
+            bucket = storage_client.bucket(GCS_BUCKET)
+
+            uploaded = 0
+            for parquet_file in parquet_files:
+                hdfs_file_path = f"{hdfs_dir}/{parquet_file}"
+                open_url = f"{webhdfs_base}{hdfs_file_path}"
+                logging.info("Uploading file from HDFS path: %s", hdfs_file_path)
+                file_resp = requests.get(
+                    open_url,
+                    params={"op": "OPEN", "user.name": "root"},
+                    timeout=120,
+                    stream=True,
+                )
+                file_resp.raise_for_status()
+
+                blob = bucket.blob(f"{gcs_path}/{parquet_file}")
+                blob.upload_from_file(file_resp.raw, rewind=False)
+                uploaded += 1
+
+            logging.info("Uploaded %s parquet file(s) to gs://%s/%s", uploaded, GCS_BUCKET, gcs_path)
             return {
                 'status': 'success',
                 'gcs_path': f'gs://{GCS_BUCKET}/{gcs_path}',
                 'execution_date': execution_date,
+                'uploaded_files': uploaded,
             }
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Export failed: {e.stderr}")
+        except Exception as e:
+            logging.error("Export failed: %s", e)
             raise
-        finally:
-            subprocess.run(['rm', '-rf', tmp_dir])
     
     # 4. Load to BigQuery
     @task(task_id='load_to_bigquery')

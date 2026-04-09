@@ -9,7 +9,13 @@ RUN apt-get update && \
         netcat-openbsd \
         gcc \
         g++ \
-        && rm -rf /var/lib/apt/lists/*
+        openjdk-17-jre-headless \
+        && rm -rf /var/lib/apt/lists/* \
+        && ln -sfn "$(dirname "$(dirname "$(readlink -f /usr/bin/java)")")" /opt/java
+
+# Spark / PySpark needs a JVM; slim Airflow image does not ship one. /opt/java works on amd64 and arm64.
+ENV JAVA_HOME=/opt/java
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 RUN chmod -R 755 /opt/airflow/dags/ && \
     chown -R airflow:root /opt/airflow/dags/

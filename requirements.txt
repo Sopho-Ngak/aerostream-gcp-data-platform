@@ -4,8 +4,8 @@ kafka-python==2.3.0
 requests==2.32.5
 
 
-# Core
-pyspark==4.1.1
+# Core — must match Spark cluster image (docker-compose spark-master: apache/spark:4.0.2-...)
+pyspark==4.0.2
 
 
 # Spark integration

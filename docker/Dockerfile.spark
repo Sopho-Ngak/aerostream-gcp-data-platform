@@ -1,0 +1,10 @@
+FROM apache/spark:4.0.2-scala2.13-java17-python3-r-ubuntu
+
+USER root
+
+# Match Airflow (python3.11) to avoid PySpark driver/executor minor mismatch.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-distutils && \
+    rm -rf /var/lib/apt/lists/*
+
+USER spark

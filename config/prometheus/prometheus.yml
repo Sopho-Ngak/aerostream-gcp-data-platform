@@ -3,9 +3,12 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: 'kafka'
-    static_configs:
-      - targets: ['kafka:9092']
+  # Kafka broker port 9092 speaks Kafka binary protocol, not HTTP metrics.
+  # Scraping it with Prometheus causes InvalidReceiveException in Kafka logs.
+  # Use a Kafka exporter/JMX exporter endpoint instead, if/when added.
+  # - job_name: 'kafka'
+  #   static_configs:
+  #     - targets: ['kafka:9092']
   
   - job_name: 'spark'
     static_configs:
