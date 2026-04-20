@@ -4,14 +4,13 @@ Runs quality checks on BigQuery tables
 """
 
 from airflow.decorators import dag, task
-from airflow.models.baseoperator import chain
-from airflow.providers.google.cloud.operators.bigquery import BigQueryCheckOperator, BigQueryValueCheckOperator
+import os
 from datetime import datetime, timedelta
 
 default_args = {
     "depends_on_past": False,
     "retries": 1,
-    "retry_delay": timedelta(minutes=5),
+    "retry_delay": timedelta(minutes=0.5),
     # 'queue': 'bash_queue',
     # 'pool': 'backfill',
     # 'priority_weight': 10,
@@ -37,27 +36,44 @@ default_args = {
 )
 def data_quality_dag():
     """Data quality checks for flight data"""
-    
+
     # Row count check
-    check_row_count = BigQueryCheckOperator(
-        task_id='check_row_count',
-        sql="""
-            SELECT COUNT(*) 
-            FROM `{{ dag_run.conf['project_id']|default(run_id, true) }}.{{ dag_run.conf['dataset'] }}.{{ dag_run.conf['table_name'] }}`
-            WHERE ingestion_date = '{{ dag_run.conf['execution_date'] }}'
-            HAVING COUNT(*) > 0
-        """,
-        use_legacy_sql=False,
-        gcp_conn_id='google_cloud_default',
-    )
+    @task(task_id='check_row_count')
+    def check_row_count(**context):
+        """Check that the target table has rows for the given date"""
+        from google.cloud import bigquery
+
+        conf = context['dag_run'].conf or {}
+        project_id = conf.get('project_id', os.getenv('GCP_PROJECT_ID', 'aerostream-project'))
+        dataset = conf.get('dataset', os.getenv('BIGQUERY_DATASET', 'aviation'))
+        table_name = conf.get('table_name', 'flight_metrics')
+        execution_date = conf.get('execution_date', str(context.get('ds', '')))
+
+        client = bigquery.Client(project=project_id)
+        query = f"""
+            SELECT COUNT(*) as row_count
+            FROM `{project_id}.{dataset}.{table_name}`
+            WHERE ingestion_date = '{execution_date}'
+        """
+        result = client.query(query).result()
+        row = next(result)
+        if row.row_count == 0:
+            raise ValueError(f"No rows found in {project_id}.{dataset}.{table_name} for date {execution_date}")
+        return {"status": "passed", "row_count": row.row_count}
     
     # Column null check
     @task(task_id='check_nulls')
     def check_nulls(**context):
         """Check for null values in critical columns"""
         from google.cloud import bigquery
-        
-        client = bigquery.Client()
+
+        conf = context['dag_run'].conf or {}
+        project_id = conf.get('project_id', os.getenv('GCP_PROJECT_ID', 'aerostream-project'))
+        dataset = conf.get('dataset', os.getenv('BIGQUERY_DATASET', 'aviation'))
+        table_name = conf.get('table_name', 'flight_metrics')
+        execution_date = conf.get('execution_date', str(context.get('ds', '')))
+
+        client = bigquery.Client(project=project_id)
         query = f"""
             SELECT 
                 COUNT(*) as total_rows,
@@ -65,8 +81,8 @@ def data_quality_dag():
                 COUNTIF(longitude IS NULL) as null_longitude,
                 COUNTIF(latitude IS NULL) as null_latitude,
                 COUNTIF(altitude_km IS NULL) as null_altitude
-            FROM `{context['dag_run'].conf['project_id']}.{context['dag_run'].conf['dataset']}.{context['dag_run'].conf['table_name']}`
-            WHERE ingestion_date = '{context['dag_run'].conf['execution_date']}'
+            FROM `{project_id}.{dataset}.{table_name}`
+            WHERE ingestion_date = '{execution_date}'
         """
         
         result = client.query(query).result()
@@ -95,7 +111,12 @@ def data_quality_dag():
     def validate_schema(**context):
         """Validate that table schema matches expected structure"""
         from google.cloud import bigquery
-        
+
+        conf = context['dag_run'].conf or {}
+        project_id = conf.get('project_id', os.getenv('GCP_PROJECT_ID', 'aerostream-project'))
+        dataset = conf.get('dataset', os.getenv('BIGQUERY_DATASET', 'aviation'))
+        table_name = conf.get('table_name', 'flight_metrics')
+
         expected_fields = {
             'icao24': 'STRING',
             'callsign': 'STRING',
@@ -107,8 +128,8 @@ def data_quality_dag():
             'ingestion_date': 'DATE'
         }
         
-        client = bigquery.Client()
-        table_ref = f"{context['dag_run'].conf['project_id']}.{context['dag_run'].conf['dataset']}.{context['dag_run'].conf['table_name']}"
+        client = bigquery.Client(project=project_id)
+        table_ref = f"{project_id}.{dataset}.{table_name}"
         table = client.get_table(table_ref)
         
         actual_fields = {field.name: field.field_type for field in table.schema}
@@ -131,11 +152,16 @@ def data_quality_dag():
         """Check if data is recent enough"""
         from google.cloud import bigquery
         from datetime import datetime, timedelta
-        
-        client = bigquery.Client()
+
+        conf = context['dag_run'].conf or {}
+        project_id = conf.get('project_id', os.getenv('GCP_PROJECT_ID', 'aerostream-project'))
+        dataset = conf.get('dataset', os.getenv('BIGQUERY_DATASET', 'aviation'))
+        table_name = conf.get('table_name', 'flight_metrics')
+
+        client = bigquery.Client(project=project_id)
         query = f"""
             SELECT MAX(ingestion_date) as latest_date
-            FROM `{context['dag_run'].conf['project_id']}.{context['dag_run'].conf['dataset']}.{context['dag_run'].conf['table_name']}`
+            FROM `{project_id}.{dataset}.{table_name}`
         """
         
         result = client.query(query).result()
@@ -151,11 +177,12 @@ def data_quality_dag():
         return {"latest_date": str(latest_date), "status": "fresh"}
     
     # Run all checks
+    row_count_check = check_row_count()
     null_check = check_nulls()
     schema_check = validate_schema()
     freshness_check = check_freshness()
-    
+
     # Chain dependencies
-    check_row_count >> null_check >> schema_check >> freshness_check
+    row_count_check >> null_check >> schema_check >> freshness_check
 
 dag = data_quality_dag()

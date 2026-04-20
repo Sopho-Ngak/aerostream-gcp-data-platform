@@ -32,7 +32,7 @@ up:
 	@echo "Access URLs:"
 	@echo "  - Spark Master: http://localhost:8080"
 	@echo "  - Airflow 3 API Server: http://localhost:8082"
-	@echo "  - Kafka Broker: localhost:9092"
+	@echo "  - Kafka UI: http://localhost:8085"
 	@echo "  - BigQuery + Looker Studio live in GCP"
 	@echo ""
 	@echo "Airflow 3 Credentials: admin / admin"
