@@ -46,14 +46,6 @@ if ! airflow connections get spark_default 2>/dev/null; then
         --conn-port '7077' || true
 fi
 
-if ! airflow connections get hdfs_default 2>/dev/null; then
-    echo "🔌 Adding HDFS connection..."
-    airflow connections add 'hdfs_default' \
-        --conn-type 'hdfs' \
-        --conn-host 'hdfs://namenode' \
-        --conn-port '9000' || true
-fi
-
 echo "✅ Airflow initialization complete"
 echo ""
 echo "========================================="

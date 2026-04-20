@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-.PHONY: help setup up down restart logs clean test init-hdfs airflow-init
+.PHONY: help setup up down restart logs clean test airflow-init
 
 help:
 	@echo "Available commands:"
@@ -10,14 +10,13 @@ help:
 	@echo "  make logs       - View logs from all services"
 	@echo "  make clean      - Remove all containers and volumes"
 	@echo "  make test       - Run health checks"
-	@echo "  make init-hdfs  - Initialize HDFS directories"
 	@echo "  make airflow-init - Initialize Airflow 3"
 
 setup:
 	@echo "📁 Creating directory structure..."
 	@mkdir -p logs/airflow logs/ingestion logs/spark
 	@mkdir -p spark-apps data/raw data/processed
-	@mkdir -p config/{airflow,hadoop,spark,prometheus}
+	@mkdir -p config/{airflow,spark}
 	@mkdir -p dags src scripts
 	@chmod +x scripts/*.sh scripts/*.py
 	@. scripts/pull_docker_images.sh
@@ -25,31 +24,39 @@ setup:
 
 up:
 	@echo "🚀 Starting all services..."
-	@docker compose up -d
+	@echo "Running command: docker compose up $(args) -d"
+	@docker compose up $(args) -d
 	@echo "✅ Services started"
 	@sleep 10
 	@echo ""
 	@echo "Access URLs:"
-	@echo "  Spark Master: http://localhost:8080"
-	@echo "  Airflow 3 API Server: http://localhost:8082"
-	@echo "  Superset: http://localhost:8088"
-	@echo "  Kafka UI: http://localhost:8083"
-	@echo "  Hadoop NameNode: http://localhost:9870"
-	@echo "  Grafana: http://localhost:3000 (admin/admin)"
-	@echo "  Prometheus: http://localhost:9090"
+	@echo "  - Spark Master: http://localhost:8080"
+	@echo "  - Airflow 3 API Server: http://localhost:8082"
+	@echo "  - Kafka Broker: localhost:9092"
+	@echo "  - BigQuery + Looker Studio live in GCP"
 	@echo ""
 	@echo "Airflow 3 Credentials: admin / admin"
 
 down:
 	@echo "🛑 Stopping all services..."
-	@docker compose down
+	@echo "Running command: docker compose down $(args)"
+	@docker compose down $(args)
 	@echo "✅ Services stopped"
 
 restart: down up
 
 logs:
-	@docker compose logs -f --tail=100
-
+	@echo "📜 Tailing logs from services..."
+	@echo "Running command: docker compose logs -f --tail=100 $(args)"
+	@if [[ -n "$(args)" ]]; then \
+		if ! docker compose config --services | grep -qE '^($(args))$$'; then \
+			echo "❌ Error: Service '$(args)' not found."; \
+			echo "Available services are:"; \
+			docker compose config --services | sed 's/^/  - /'; \
+			exit 1; \
+		fi; \
+	fi
+	@docker compose logs -f --tail=100 $(args)
 clean:
 	@echo "🧹 Cleaning up..."
 	@docker compose down -v
@@ -61,15 +68,9 @@ test:
 	@echo "🔍 Running health checks..."
 	@python scripts/test_setup.py
 
-init-hdfs:
-	@echo "📁 Initializing HDFS..."
-	@docker exec namenode bash -c "hdfs dfs -mkdir -p /aviation/flights/raw /aviation/flights/processed /aviation/aggregates /aviation/checkpoints"
-	@docker exec namenode bash -c "hdfs dfs -chmod -R 755 /aviation"
-	@echo "✅ HDFS initialized"
-
 airflow-init:
 	@echo "🚀 Initializing Airflow 3..."
-	@docker compose up -d airflow-postgres redis
+	@docker compose up -d airflow-postgres
 	@sleep 5
 	@docker compose run --rm airflow-init
 	@echo "✅ Airflow 3 initialized"

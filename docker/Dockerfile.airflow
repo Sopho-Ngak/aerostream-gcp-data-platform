@@ -17,6 +17,13 @@ RUN apt-get update && \
 ENV JAVA_HOME=/opt/java
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
+# The Airflow container runs spark-submit in client mode for batch jobs,
+# so it needs the same GCS connector support as the Spark runtime containers.
+RUN mkdir -p /opt/spark/jars && \
+    curl -fsSL \
+      "https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-hadoop3-latest.jar" \
+      -o /opt/spark/jars/gcs-connector-hadoop3-latest.jar
+
 RUN chmod -R 755 /opt/airflow/dags/ && \
     chown -R airflow:root /opt/airflow/dags/
 

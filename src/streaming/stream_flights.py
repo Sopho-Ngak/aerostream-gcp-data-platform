@@ -1,14 +1,22 @@
+import os
+import logging
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col
 from pyspark.sql.types import *
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+GCS_BUCKET = os.environ["GCS_BUCKET_NAME"]
+
 spark = SparkSession.builder \
-    .appName("AviationStream")  \
+    .appName("AviationStream") \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("WARN")
 
-print("✅ Spark session created successfully")
+logger.info("✅ Spark session created successfully")
 
 schema = StructType([
     StructField("icao24", StringType(), True),
@@ -30,45 +38,35 @@ schema = StructType([
     StructField("position_source", IntegerType(), True)
 ])
 
+logger.info("✅ Schema defined successfully")
 df = spark \
     .readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "kafka:9092") \
-    .option("kafka.group.id", "aviation-stream-consumer") \
     .option("subscribe", "aviation_flights") \
     .option("startingOffsets", "latest") \
     .option("failOnDataLoss", "false") \
     .option("kafka.metadata.max.age.ms", "5000") \
+    .option("kafkaConsumer.pollTimeoutMs", "120000") \
+    .option("kafka.request.timeout.ms", "60000") \
+    .option("kafka.session.timeout.ms", "30000") \
+    .option("kafka.max.block.ms", "60000") \
+    .option("maxOffsetsPerTrigger", "20000") \
     .load()
+
 
 json_df = df.selectExpr("CAST(value AS STRING) as json_str") \
     .select(from_json(col("json_str"), schema).alias("data")) \
     .select("data.*")
 
 
-# Debug query to see data in memory
-debug_query = json_df.writeStream \
-    .format("memory") \
-    .queryName("debug_table") \
-    .outputMode("append") \
-    .trigger(processingTime="5 seconds") \
-    .start()
-
-
 query = json_df.writeStream \
     .format("parquet") \
-    .option("path", "hdfs://namenode:9000/aviation/flights") \
-    .option("checkpointLocation", "hdfs://namenode:9000/aviation/flights/checkpoint") \
+    .option("path", f"gs://{GCS_BUCKET}/aviation/flights/raw") \
+    .option("checkpointLocation", f"gs://{GCS_BUCKET}/aviation/checkpoints/flights") \
     .outputMode("append") \
+    .trigger(processingTime="30 seconds") \
     .start()
 
-
-# Let it run for a bit to collect data
-import time
-time.sleep(10)
-
-# Query the in-memory table to see the data
-result = spark.sql("SELECT * FROM debug_table LIMIT 10")
-print(result.show(truncate=False))
-
+logger.info(f"✅ Streaming query started, writing parquet to gs://{GCS_BUCKET}/aviation/flights/raw every 30s")
 query.awaitTermination()

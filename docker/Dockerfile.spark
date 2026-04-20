@@ -4,7 +4,12 @@ USER root
 
 # Match Airflow (python3.11) to avoid PySpark driver/executor minor mismatch.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-distutils && \
+    apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-distutils curl && \
     rm -rf /var/lib/apt/lists/*
+
+# GCS connector — enables gs:// paths natively from all Spark jobs.
+RUN curl -fsSL \
+    "https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-hadoop3-latest.jar" \
+    -o /opt/spark/jars/gcs-connector-hadoop3-latest.jar
 
 USER spark

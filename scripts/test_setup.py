@@ -14,11 +14,8 @@ logger = logging.getLogger(__name__)
 SERVICES = {
     "zookeeper": (2181, "tcp"),
     "kafka": (9092, "tcp"),
-    "namenode": (9870, "http"),
-    "datanode": (9864, "http"),
     "spark-master": (8080, "http"),
-    "airflow-webserver": (8082, "http"),
-    "superset": (8088, "http")
+    "airflow-api-server": (8082, "http")
 }
 
 def check_tcp_connection(host, port):

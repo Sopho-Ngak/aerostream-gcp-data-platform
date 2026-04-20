@@ -32,12 +32,6 @@ airflow connections add 'spark_default' \
     --conn-host 'spark://spark-master' \
     --conn-port '7077'
 
-echo "Adding HDFS connection..."
-airflow connections add 'hdfs_default' \
-    --conn-type 'hdfs' \
-    --conn-host 'hdfs://namenode' \
-    --conn-port '9000'
-
 echo "✅ Airflow 3 initialization complete!"
 echo ""
 echo "========================================="

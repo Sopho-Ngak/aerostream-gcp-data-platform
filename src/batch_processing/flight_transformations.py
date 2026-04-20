@@ -1,20 +1,17 @@
 """
-Batch job: read raw flight Parquet from HDFS (Kafka streaming sink), aggregate metrics, write partitioned Parquet.
+Batch job: read raw flight Parquet from GCS (Kafka streaming sink), aggregate metrics,
+write partitioned Parquet back to GCS for direct BigQuery load.
 
 Run by Airflow SparkSubmitOperator with --processing_date YYYY-MM-DD.
 """
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit, when
-from pyspark.sql.types import (
-    DoubleType,
-    StringType,
-    StructField,
-    StructType,
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,60 +23,61 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     ds = args.processing_date
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
 
-    # Under spark-submit the JVM already created a SparkContext; reuse it (--name sets the app name).
+    gcs_bucket = os.environ["GCS_BUCKET_NAME"]
+    raw_path = f"gs://{gcs_bucket}/aviation/flights/raw"
+    out_path = f"gs://{gcs_bucket}/flight_metrics/ingestion_date={ds}"
+
+    # Under spark-submit the JVM already created a SparkContext; reuse it.
     spark = SparkSession.builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
 
-    raw_candidates = [
-        "hdfs://namenode:9000/aviation/flights",
-        "hdfs://namenode:9000/tmp/aviation/flights",
-    ]
-    # /tmp is generally writable for non-superusers in HDFS dev setups.
-    out_path = f"hdfs://namenode:9000/tmp/aviation/processed/flight_metrics/ingestion_date={ds}"
+    parquet_glob = f"{raw_path}/*.parquet"
+    try:
+        logger.info("Reading raw parquet from: %s", parquet_glob)
+        df = spark.read.parquet(parquet_glob)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read raw parquet from {parquet_glob}: {exc}"
+        ) from exc
 
-    empty_schema = StructType(
-        [
-            StructField("icao24", StringType(), True),
-            StructField("origin_country", StringType(), True),
-            StructField("ingestion_date", StringType(), True),
-            StructField("altitude_km", DoubleType(), True),
-            StructField("speed_kmh", DoubleType(), True),
-        ]
+    source_count = df.count()
+    logger.info("Read %s records from raw path: %s", source_count, raw_path)
+
+    if source_count == 0:
+        raise RuntimeError(
+            f"Raw input exists but has 0 rows for processing_date={ds} at {raw_path}. "
+            "Failing fast to avoid exporting empty parquet downstream."
+        )
+
+    base = (
+        df.withColumn("ingestion_date", lit(ds))
+        .withColumn(
+            "altitude_km",
+            when(col("baro_altitude").isNotNull(), col("baro_altitude") / 1000.0).otherwise(None),
+        )
+        .withColumn(
+            "speed_kmh",
+            when(col("velocity").isNotNull(), col("velocity") * 3.6).otherwise(None),
+        )
+    )
+    out = base.select(
+        col("icao24"),
+        col("origin_country"),
+        col("ingestion_date"),
+        col("altitude_km"),
+        col("speed_kmh"),
     )
 
-    df = None
-    for raw_path in raw_candidates:
-        try:
-            df = spark.read.parquet(raw_path)
-            break
-        except Exception:
-            continue
-    if df is None:
-        df = spark.createDataFrame([], empty_schema)
-
-    if df.limit(1).count() == 0:
-        out = spark.createDataFrame([], empty_schema)
-    else:
-        # Align with streaming JSON fields (see src/streaming/stream_flights.py)
-        base = (
-            df.withColumn("ingestion_date", lit(ds))
-            .withColumn(
-                "altitude_km",
-                when(col("baro_altitude").isNotNull(), col("baro_altitude") / 1000.0).otherwise(None),
-            )
-            .withColumn(
-                "speed_kmh",
-                when(col("velocity").isNotNull(), col("velocity") * 3.6).otherwise(None),
-            )
+    output_count = out.count()
+    if output_count == 0:
+        raise RuntimeError(
+            f"Transformed output has 0 rows for processing_date={ds}. "
+            "Failing fast to prevent empty downstream loads."
         )
-        out = base.select(
-            col("icao24"),
-            col("origin_country"),
-            col("ingestion_date"),
-            col("altitude_km"),
-            col("speed_kmh"),
-        )
+    logger.info("Writing %s transformed records to %s", output_count, out_path)
 
     out.write.mode("overwrite").parquet(out_path)
     spark.stop()

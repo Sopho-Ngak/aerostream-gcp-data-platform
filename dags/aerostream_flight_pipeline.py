@@ -10,12 +10,13 @@ from airflow.sdk import dag, task
 from datetime import datetime, timedelta
 import logging
 import os
+import time
 
 # Default arguments
 default_args = {
     "depends_on_past": False,
     "retries": 1,
-    "retry_delay": timedelta(minutes=5),
+    "retry_delay": timedelta(minutes=0.5),
     # 'queue': 'bash_queue',
     # 'pool': 'backfill',
     # 'priority_weight': 10,
@@ -71,8 +72,41 @@ def aerostream_pipeline():
                 raise Exception("❌ Kafka is not running")
         except Exception as e:
             raise Exception(f"❌ Failed to connect to Kafka: {e}")
+
+    @task(task_id='wait_for_raw_flight_data', retries=0)
+    def wait_for_raw_flight_data():
+        """Wait for streaming parquet files to appear in GCS before batch processing."""
+        from google.cloud import storage
+
+        gcs_prefix = "aviation/flights/raw/"
+        poll_seconds = int(os.getenv("RAW_DATA_POLL_SECONDS", "30"))
+        max_attempts = int(os.getenv("RAW_DATA_MAX_ATTEMPTS", "20"))
+
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(GCS_BUCKET)
+
+        for attempt in range(1, max_attempts + 1):
+            blobs = list(bucket.list_blobs(prefix=gcs_prefix, max_results=10))
+            parquet_blobs = [b for b in blobs if b.name.endswith(".parquet")]
+
+            if parquet_blobs:
+                logging.info("Found %s raw parquet file(s) in GCS; continuing.", len(parquet_blobs))
+                return {"status": "ready", "raw_parquet_files": len(parquet_blobs)}
+
+            logging.info(
+                "No raw parquet files found yet (attempt %s/%s). Sleeping %ss.",
+                attempt,
+                max_attempts,
+                poll_seconds,
+            )
+            time.sleep(poll_seconds)
+
+        raise ValueError(
+            "No raw parquet files found in GCS after waiting. "
+            "Ensure ingestion and streaming services are running and writing to GCS."
+        )
     
-    # 2. Run Spark batch processing on HDFS data
+    # 2. Run Spark batch processing — reads GCS raw, writes GCS processed
     process_flight_batch = SparkSubmitOperator(
         task_id='process_flight_batch',
         application='/opt/airflow/src/batch_processing/flight_transformations.py',
@@ -80,12 +114,18 @@ def aerostream_pipeline():
         conn_id='spark_default',
         conf={
             'spark.master': 'spark://spark-master:7077',
-            'spark.executor.memory': '2g',
-            'spark.driver.memory': '2g',
+            'spark.executor.memory': '1g',
+            'spark.driver.memory': '1g',
             'spark.pyspark.python': 'python3.11',
             'spark.pyspark.driver.python': 'python3.11',
             'spark.sql.adaptive.enabled': 'true',
             'spark.sql.adaptive.coalescePartitions.enabled': 'true',
+            'spark.jars.packages': 'com.google.cloud.bigdataoss:gcs-connector:4.0.4',
+            'spark.jars.ivy': '/tmp/.ivy2',
+            'spark.hadoop.fs.gs.impl': 'com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem',
+            'spark.hadoop.fs.AbstractFileSystem.gs.impl': 'com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS',
+            'spark.hadoop.google.cloud.auth.service.account.enable': 'true',
+            'spark.hadoop.google.cloud.auth.service.account.json.keyfile': '/opt/airflow/config/gcp/gcp-credentials.json',
         },
         application_args=[
             '--processing_date', '{{ ds }}',
@@ -93,76 +133,25 @@ def aerostream_pipeline():
         verbose=True,
     )
     
-    # 3. Export to GCS
-    @task(
-        task_id='export_to_gcs',
-        retries=2,
-        retry_delay=timedelta(minutes=2)
-    )
-    def export_to_gcs(**context):
-        """Export processed data from HDFS to GCS"""
-        import requests
-        from google.cloud import storage
-
-        execution_date = context['ds']
-        hdfs_dir = f"/tmp/aviation/processed/flight_metrics/ingestion_date={execution_date}"
-        gcs_path = f"flight_metrics/ingestion_date={execution_date}"
-        webhdfs_base = "http://namenode:9870/webhdfs/v1"
-        list_url = f"{webhdfs_base}{hdfs_dir}"
-
-        try:
-            # List files from HDFS using WebHDFS.
-            logging.info("Listing files in HDFS path: %s", hdfs_dir)
-            list_resp = requests.get(
-                list_url,
-                params={"op": "LISTSTATUS", "user.name": "root"},
-                timeout=30,
-            )
-            list_resp.raise_for_status()
-            statuses = list_resp.json()["FileStatuses"]["FileStatus"]
-            parquet_files = [s["pathSuffix"] for s in statuses if s["type"] == "FILE" and s["pathSuffix"].endswith(".parquet")]
-
-            if not parquet_files:
-                raise ValueError(f"No parquet files found in HDFS path: {hdfs_dir}")
-
-            storage_client = storage.Client(project=GCP_PROJECT_ID)
-            bucket = storage_client.bucket(GCS_BUCKET)
-
-            uploaded = 0
-            for parquet_file in parquet_files:
-                hdfs_file_path = f"{hdfs_dir}/{parquet_file}"
-                open_url = f"{webhdfs_base}{hdfs_file_path}"
-                logging.info("Uploading file from HDFS path: %s", hdfs_file_path)
-                file_resp = requests.get(
-                    open_url,
-                    params={"op": "OPEN", "user.name": "root"},
-                    timeout=120,
-                    stream=True,
-                )
-                file_resp.raise_for_status()
-
-                blob = bucket.blob(f"{gcs_path}/{parquet_file}")
-                blob.upload_from_file(file_resp.raw, rewind=False)
-                uploaded += 1
-
-            logging.info("Uploaded %s parquet file(s) to gs://%s/%s", uploaded, GCS_BUCKET, gcs_path)
-            return {
-                'status': 'success',
-                'gcs_path': f'gs://{GCS_BUCKET}/{gcs_path}',
-                'execution_date': execution_date,
-                'uploaded_files': uploaded,
-            }
-        except Exception as e:
-            logging.error("Export failed: %s", e)
-            raise
-    
-    # 4. Load to BigQuery
+    # 3. Load to BigQuery
     @task(task_id='load_to_bigquery')
     def load_to_bigquery(**context):
         """Load files from GCS to BigQuery"""
         from google.cloud import bigquery
+        from google.api_core.exceptions import NotFound
         
         client = bigquery.Client(project=GCP_PROJECT_ID)
+        execution_date = context['ds']
+
+        # Ensure dataset exists before loading tables.
+        dataset_ref = bigquery.DatasetReference(GCP_PROJECT_ID, BQ_DATASET)
+        try:
+            client.get_dataset(dataset_ref)
+        except NotFound:
+            dataset = bigquery.Dataset(dataset_ref)
+            dataset.location = os.getenv('BIGQUERY_LOCATION', 'US')
+            client.create_dataset(dataset)
+            logging.info("Created missing dataset: %s.%s", GCP_PROJECT_ID, BQ_DATASET)
         
         # Configure the load job
         job_config = bigquery.LoadJobConfig(
@@ -172,12 +161,11 @@ def aerostream_pipeline():
             autodetect=True,
             time_partitioning=bigquery.TimePartitioning(
                 type_=bigquery.TimePartitioningType.DAY,
-                field='ingestion_date'
             ),
         )
         
         # Load all files
-        uri = f"gs://{GCS_BUCKET}/flight_metrics/ingestion_date={{ ds }}/*.parquet"
+        uri = f"gs://{GCS_BUCKET}/flight_metrics/ingestion_date={execution_date}/*.parquet"
         table_ref = client.dataset(BQ_DATASET).table('flight_metrics')
         
         load_job = client.load_table_from_uri(
@@ -190,17 +178,19 @@ def aerostream_pipeline():
         
         return {
             'rows_loaded': result.output_rows,
-            'bytes_processed': result.total_bytes_processed,
+            'input_file_bytes': getattr(result, 'input_file_bytes', None),
+            'input_files': getattr(result, 'input_files', None),
+            'job_id': load_job.job_id,
             'table': f'{GCP_PROJECT_ID}.{BQ_DATASET}.flight_metrics'
         }
     
-    # 5. Create BigQuery analytics views
+    # 4. Create BigQuery analytics views
     create_analytics_views = BigQueryInsertJobOperator(
         task_id='create_analytics_views',
         configuration={
             'query': {
-                'query': """
-                    CREATE OR REPLACE VIEW `{{ var.value.GCP_PROJECT_ID }}.{{ var.value.BIGQUERY_DATASET }}.country_summary` AS
+                'query': f"""
+                    CREATE OR REPLACE VIEW `{GCP_PROJECT_ID}.{BQ_DATASET}.country_summary` AS
                     SELECT 
                         origin_country,
                         DATE(ingestion_date) as flight_date,
@@ -208,8 +198,8 @@ def aerostream_pipeline():
                         COUNT(*) as total_flights,
                         AVG(altitude_km) as avg_altitude_km,
                         AVG(speed_kmh) as avg_speed_kmh
-                    FROM `{{ var.value.GCP_PROJECT_ID }}.{{ var.value.BIGQUERY_DATASET }}.flight_metrics`
-                    WHERE ingestion_date = '{{ ds }}'
+                    FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.flight_metrics`
+                    WHERE ingestion_date = '{{{{ ds }}}}'
                     GROUP BY origin_country, flight_date;
                 """,
                 'useLegacySql': False
@@ -218,7 +208,7 @@ def aerostream_pipeline():
         location='US',
     )
     
-    # 6. Data quality check
+    # 5. Data quality check
     @task(task_id='data_quality_check')
     def data_quality_check(**context):
         """Basic data quality check"""
@@ -241,7 +231,7 @@ def aerostream_pipeline():
         logging.info(f"✅ Data quality check passed: {row.row_count} rows loaded")
         return {"row_count": row.row_count}
     
-    # 7. Send success notification
+    # 6. Send success notification
     @task(
         task_id='send_notification',
         trigger_rule=TriggerRule.ALL_SUCCESS,
@@ -254,11 +244,11 @@ def aerostream_pipeline():
     
     # Build the DAG
     kafka_check = check_kafka_stream()
-    gcs_export = export_to_gcs()
+    raw_data_ready = wait_for_raw_flight_data()
     bq_load = load_to_bigquery()
     quality_check = data_quality_check()
     
-    kafka_check >> process_flight_batch >> gcs_export >> bq_load >> create_analytics_views >> quality_check >> send_success()
+    kafka_check >> raw_data_ready >> process_flight_batch >> bq_load >> create_analytics_views >> quality_check >> send_success()
 
 # Create the DAG
 dag = aerostream_pipeline()
