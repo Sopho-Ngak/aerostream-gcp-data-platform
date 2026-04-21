@@ -34,6 +34,8 @@ default_args = {
 GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID', 'aerostream-project')
 GCS_BUCKET = os.getenv('GCS_BUCKET_NAME', 'aerostream-data-lake')
 BQ_DATASET = os.getenv('BIGQUERY_DATASET', 'aviation')
+RAW_BQ_TABLE = os.getenv('BIGQUERY_RAW_TABLE', 'flight_stream_raw')
+TRANSFORMED_BQ_TABLE = os.getenv('BIGQUERY_TRANSFORMED_TABLE', 'flight_metrics')
 DATA_QUALITY_DAG_ID = os.getenv('DATA_QUALITY_DAG_ID', 'aerostream_data_quality')
 
 # Define the main DAG using Airflow 3 syntax
@@ -181,10 +183,85 @@ def aerostream_pipeline():
         logging.info("Spark batch processing completed successfully")
         return {"status": "success", "processing_date": execution_date}
     
-    # 3. Load to BigQuery
-    @task(task_id='load_to_bigquery')
-    def load_to_bigquery(**context):
-        """Load files from GCS to BigQuery"""
+    # 3. Load raw streaming parquet to BigQuery (all incoming columns)
+    @task(task_id='load_raw_stream_to_bigquery')
+    def load_raw_stream_to_bigquery(raw_data_info):
+        """Load new raw streaming parquet files from GCS to BigQuery."""
+        from google.cloud import bigquery
+        from google.cloud import storage
+        from google.api_core.exceptions import NotFound
+
+        if not isinstance(raw_data_info, dict):
+            raise ValueError('Missing raw_data_info payload from wait_for_raw_flight_data task')
+
+        latest_blob_path = raw_data_info.get('latest_blob_path')
+        if not latest_blob_path:
+            raise ValueError('latest_blob_path not found in raw_data_info payload')
+
+        watermark_key = 'raw_bq_last_loaded_blob_updated'
+        last_loaded_ts_raw = Variable.get(watermark_key, default_var='1970-01-01T00:00:00+00:00')
+        last_loaded_ts = datetime.fromisoformat(last_loaded_ts_raw.replace('Z', '+00:00'))
+
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(GCS_BUCKET)
+        new_uris = []
+        newest_seen_ts = last_loaded_ts
+
+        for blob in bucket.list_blobs(prefix='aviation/flights/raw/', page_size=500):
+            if not blob.name.endswith('.parquet'):
+                continue
+            if getattr(blob, 'size', 0) == 0:
+                continue
+            if blob.updated and blob.updated > last_loaded_ts:
+                new_uris.append(f'gs://{GCS_BUCKET}/{blob.name}')
+                if blob.updated > newest_seen_ts:
+                    newest_seen_ts = blob.updated
+
+        if not new_uris:
+            logging.info('No new raw parquet files to load since %s', last_loaded_ts.isoformat())
+            return {
+                'rows_loaded': 0,
+                'job_id': None,
+                'source_uris': [],
+                'table': f'{GCP_PROJECT_ID}.{BQ_DATASET}.{RAW_BQ_TABLE}',
+            }
+
+        client = bigquery.Client(project=GCP_PROJECT_ID)
+
+        dataset_ref = bigquery.DatasetReference(GCP_PROJECT_ID, BQ_DATASET)
+        try:
+            client.get_dataset(dataset_ref)
+        except NotFound:
+            dataset = bigquery.Dataset(dataset_ref)
+            dataset.location = os.getenv('BIGQUERY_LOCATION', 'US')
+            client.create_dataset(dataset)
+            logging.info("Created missing dataset: %s.%s", GCP_PROJECT_ID, BQ_DATASET)
+
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
+            autodetect=True,
+        )
+
+        table_ref = client.dataset(BQ_DATASET).table(RAW_BQ_TABLE)
+        load_job = client.load_table_from_uri(new_uris, table_ref, job_config=job_config)
+        result = load_job.result()
+
+        # Persist watermark only after successful load to avoid skipping files on retries.
+        Variable.set(watermark_key, newest_seen_ts.isoformat())
+
+        return {
+            'rows_loaded': result.output_rows,
+            'job_id': load_job.job_id,
+            'source_uris': new_uris,
+            'table': f'{GCP_PROJECT_ID}.{BQ_DATASET}.{RAW_BQ_TABLE}',
+        }
+
+    # 4. Load transformed parquet to BigQuery (dashboard table)
+    @task(task_id='load_transformed_to_bigquery')
+    def load_transformed_to_bigquery(**context):
+        """Load transformed files from GCS to BigQuery."""
         from google.cloud import bigquery
         from google.api_core.exceptions import NotFound
         
@@ -201,7 +278,6 @@ def aerostream_pipeline():
             client.create_dataset(dataset)
             logging.info("Created missing dataset: %s.%s", GCP_PROJECT_ID, BQ_DATASET)
         
-        # Configure the load job
         job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
@@ -212,9 +288,8 @@ def aerostream_pipeline():
             ),
         )
         
-        # Load all files
         uri = f"gs://{GCS_BUCKET}/flight_metrics/ingestion_date={execution_date}/*.parquet"
-        table_ref = client.dataset(BQ_DATASET).table('flight_metrics')
+        table_ref = client.dataset(BQ_DATASET).table(TRANSFORMED_BQ_TABLE)
         
         load_job = client.load_table_from_uri(
             uri,
@@ -229,10 +304,10 @@ def aerostream_pipeline():
             'input_file_bytes': getattr(result, 'input_file_bytes', None),
             'input_files': getattr(result, 'input_files', None),
             'job_id': load_job.job_id,
-            'table': f'{GCP_PROJECT_ID}.{BQ_DATASET}.flight_metrics'
+            'table': f'{GCP_PROJECT_ID}.{BQ_DATASET}.{TRANSFORMED_BQ_TABLE}'
         }
     
-    # 4. Create BigQuery analytics views
+    # 5. Create BigQuery analytics views
     @task(task_id='create_analytics_views')
     def create_analytics_views(**context):
         from google.cloud import bigquery
@@ -248,7 +323,7 @@ def aerostream_pipeline():
                 COUNT(*) as total_flights,
                 AVG(altitude_km) as avg_altitude_km,
                 AVG(speed_kmh) as avg_speed_kmh
-            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.flight_metrics`
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{TRANSFORMED_BQ_TABLE}`
             WHERE ingestion_date = '{execution_date}'
             GROUP BY origin_country, flight_date
         """
@@ -260,7 +335,7 @@ def aerostream_pipeline():
 
     create_analytics_views = create_analytics_views()
     
-    # 5. Data quality check
+    # 6. Data quality check
     @task(task_id='data_quality_check')
     def data_quality_check(**context):
         """Basic data quality check"""
@@ -271,7 +346,7 @@ def aerostream_pipeline():
         
         query = f"""
             SELECT COUNT(*) as row_count
-            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.flight_metrics`
+            FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{TRANSFORMED_BQ_TABLE}`
             WHERE ingestion_date = '{execution_date}'
         """
         
@@ -284,7 +359,7 @@ def aerostream_pipeline():
         logging.info(f"✅ Data quality check passed: {row.row_count} rows loaded")
         return {"row_count": row.row_count}
     
-    # 6. Send success notification
+    # 7. Send success notification
     @task(
         task_id='send_notification',
         trigger_rule=TriggerRule.ALL_SUCCESS,
@@ -299,7 +374,8 @@ def aerostream_pipeline():
     kafka_check = check_kafka_stream()
     raw_data_ready = wait_for_raw_flight_data()
     process_flight_batch = process_flight_batch_task(raw_data_ready)
-    bq_load = load_to_bigquery()
+    raw_bq_load = load_raw_stream_to_bigquery(raw_data_ready)
+    transformed_bq_load = load_transformed_to_bigquery()
     quality_check = data_quality_check()
     notify = send_success()
 
@@ -309,14 +385,18 @@ def aerostream_pipeline():
         conf={
             'project_id': GCP_PROJECT_ID,
             'dataset': BQ_DATASET,
-            'table_name': 'flight_metrics',
+            'table_name': TRANSFORMED_BQ_TABLE,
             'execution_date': '{{ ds }}',
         },
         wait_for_completion=False,
         reset_dag_run=False,
     )
-    
-    kafka_check >> raw_data_ready >> process_flight_batch >> bq_load >> create_analytics_views >> quality_check >> notify >> trigger_data_quality_dag
+
+    kafka_check >> raw_data_ready
+    raw_data_ready >> raw_bq_load
+    raw_data_ready >> process_flight_batch >> transformed_bq_load >> create_analytics_views >> quality_check
+    raw_bq_load >> notify
+    quality_check >> notify >> trigger_data_quality_dag
 
 # Create the DAG
 dag = aerostream_pipeline()
