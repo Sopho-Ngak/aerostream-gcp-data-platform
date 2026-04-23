@@ -101,7 +101,7 @@ def stream_flights():
             else:
                 logger.warning("No flight data received")
             
-            time.sleep(120)  # Fetch new data every 10 seconds
+            time.sleep(300)  # Fetch new data every 5 minutes
             
         except Exception as e:
             logger.error(f"Error in streaming loop: {e}")

@@ -3,7 +3,7 @@ Data Quality DAG for AeroStream
 Runs quality checks on BigQuery tables
 """
 
-from airflow.decorators import dag, task
+from airflow.sdk import dag, task
 import os
 from datetime import datetime, timedelta
 
@@ -75,12 +75,12 @@ def data_quality_dag():
 
         client = bigquery.Client(project=project_id)
         query = f"""
-            SELECT 
+            SELECT
                 COUNT(*) as total_rows,
                 COUNTIF(icao24 IS NULL) as null_icao24,
-                COUNTIF(longitude IS NULL) as null_longitude,
-                COUNTIF(latitude IS NULL) as null_latitude,
-                COUNTIF(altitude_km IS NULL) as null_altitude
+                COUNTIF(origin_country IS NULL) as null_origin_country,
+                COUNTIF(altitude_km IS NULL) as null_altitude,
+                COUNTIF(speed_kmh IS NULL) as null_speed
             FROM `{project_id}.{dataset}.{table_name}`
             WHERE ingestion_date = '{execution_date}'
         """
@@ -90,9 +90,9 @@ def data_quality_dag():
         
         thresholds = {
             'null_icao24': 5,
-            'null_longitude': 10,
-            'null_latitude': 10,
-            'null_altitude': 15
+            'null_origin_country': 10,
+            'null_altitude': 15,
+            'null_speed': 15,
         }
         
         issues = []
@@ -119,13 +119,10 @@ def data_quality_dag():
 
         expected_fields = {
             'icao24': 'STRING',
-            'callsign': 'STRING',
             'origin_country': 'STRING',
-            'longitude': 'FLOAT',
-            'latitude': 'FLOAT',
             'altitude_km': 'FLOAT',
             'speed_kmh': 'FLOAT',
-            'ingestion_date': 'DATE'
+            'ingestion_date': 'DATE',
         }
         
         client = bigquery.Client(project=project_id)

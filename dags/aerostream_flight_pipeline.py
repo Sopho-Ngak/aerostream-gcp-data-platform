@@ -237,23 +237,128 @@ def aerostream_pipeline():
             client.create_dataset(dataset)
             logging.info("Created missing dataset: %s.%s", GCP_PROJECT_ID, BQ_DATASET)
 
-        job_config = bigquery.LoadJobConfig(
+        table_ref = client.dataset(BQ_DATASET).table(RAW_BQ_TABLE)
+        staging_table_name = f"{RAW_BQ_TABLE}_staging"
+        staging_table_ref = client.dataset(BQ_DATASET).table(staging_table_name)
+
+        staging_load_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
             create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
             autodetect=True,
         )
 
-        table_ref = client.dataset(BQ_DATASET).table(RAW_BQ_TABLE)
-        load_job = client.load_table_from_uri(new_uris, table_ref, job_config=job_config)
+        load_job = client.load_table_from_uri(new_uris, staging_table_ref, job_config=staging_load_config)
         result = load_job.result()
 
-        # Persist watermark only after successful load to avoid skipping files on retries.
+        staging_table = client.get_table(staging_table_ref)
+        staging_columns = {field.name for field in staging_table.schema}
+
+        if 'icao24' not in staging_columns:
+            raise ValueError('Raw staging table does not contain required column: icao24')
+
+        order_terms = []
+        if 'last_contact' in staging_columns:
+            order_terms.append('COALESCE(SAFE_CAST(last_contact AS INT64), 0) DESC')
+        if 'time_position' in staging_columns:
+            order_terms.append('COALESCE(SAFE_CAST(time_position AS INT64), 0) DESC')
+        order_terms.append('icao24 DESC')
+        order_clause = ', '.join(order_terms)
+
+        try:
+            target_table = client.get_table(table_ref)
+            target_columns = [field.name for field in target_table.schema]
+            common_columns = [col_name for col_name in target_columns if col_name in staging_columns]
+
+            if 'icao24' not in common_columns:
+                raise ValueError('Raw target table does not contain required column: icao24')
+
+            update_columns = [col_name for col_name in common_columns if col_name != 'icao24']
+            update_set_clause = ',\n                    '.join(
+                [f"{col_name} = S.{col_name}" for col_name in update_columns]
+            )
+            when_matched_clause = ""
+            if update_set_clause:
+                when_matched_clause = f"""
+                WHEN MATCHED THEN
+                  UPDATE SET
+                    {update_set_clause}
+                """
+            insert_columns = ', '.join(common_columns)
+            insert_values = ', '.join([f"S.{col_name}" for col_name in common_columns])
+            projection = ',\n                        '.join(common_columns)
+
+            merge_query = f"""
+                MERGE `{GCP_PROJECT_ID}.{BQ_DATASET}.{RAW_BQ_TABLE}` T
+                USING (
+                    SELECT
+                        {projection}
+                    FROM (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY icao24
+                                ORDER BY {order_clause}
+                            ) AS rn
+                        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{staging_table_name}`
+                        WHERE icao24 IS NOT NULL AND TRIM(icao24) != ''
+                    )
+                    WHERE rn = 1
+                ) S
+                ON T.icao24 = S.icao24
+                {when_matched_clause}
+                WHEN NOT MATCHED THEN
+                  INSERT ({insert_columns})
+                  VALUES ({insert_values})
+            """
+
+            merge_job = client.query(merge_query)
+            merge_job.result()
+        except NotFound:
+            create_from_staging_query = f"""
+                CREATE TABLE `{GCP_PROJECT_ID}.{BQ_DATASET}.{RAW_BQ_TABLE}` AS
+                SELECT * EXCEPT(rn)
+                FROM (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY icao24
+                            ORDER BY {order_clause}
+                        ) AS rn
+                    FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{staging_table_name}`
+                    WHERE icao24 IS NOT NULL AND TRIM(icao24) != ''
+                )
+                WHERE rn = 1
+            """
+            merge_job = client.query(create_from_staging_query)
+            merge_job.result()
+
+        dedupe_query = f"""
+            CREATE OR REPLACE TABLE `{GCP_PROJECT_ID}.{BQ_DATASET}.{RAW_BQ_TABLE}` AS
+            SELECT * EXCEPT(rn)
+            FROM (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY icao24
+                        ORDER BY {order_clause}
+                    ) AS rn
+                FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{RAW_BQ_TABLE}`
+                WHERE icao24 IS NOT NULL AND TRIM(icao24) != ''
+            )
+            WHERE rn = 1
+        """
+        dedupe_job = client.query(dedupe_query)
+        dedupe_job.result()
+
+        # Persist watermark only after successful merge+dedupe to avoid skipping files on retries.
         Variable.set(watermark_key, newest_seen_ts.isoformat())
 
         return {
             'rows_loaded': result.output_rows,
             'job_id': load_job.job_id,
+            'merge_job_id': merge_job.job_id,
+            'dedupe_job_id': dedupe_job.job_id,
             'source_uris': new_uris,
             'table': f'{GCP_PROJECT_ID}.{BQ_DATASET}.{RAW_BQ_TABLE}',
         }
@@ -261,7 +366,7 @@ def aerostream_pipeline():
     # 4. Load transformed parquet to BigQuery (dashboard table)
     @task(task_id='load_transformed_to_bigquery')
     def load_transformed_to_bigquery(**context):
-        """Load transformed files from GCS to BigQuery."""
+        """Load transformed files from GCS to BigQuery with upsert on icao24."""
         from google.cloud import bigquery
         from google.api_core.exceptions import NotFound
         
@@ -277,33 +382,122 @@ def aerostream_pipeline():
             dataset.location = os.getenv('BIGQUERY_LOCATION', 'US')
             client.create_dataset(dataset)
             logging.info("Created missing dataset: %s.%s", GCP_PROJECT_ID, BQ_DATASET)
+
+        table_ref = client.dataset(BQ_DATASET).table(TRANSFORMED_BQ_TABLE)
+
+        # Ensure target table exists with expected transformed schema.
+        target_schema = [
+            bigquery.SchemaField("icao24", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("origin_country", "STRING"),
+            bigquery.SchemaField("ingestion_date", "STRING"),
+            bigquery.SchemaField("altitude_km", "FLOAT"),
+            bigquery.SchemaField("speed_kmh", "FLOAT"),
+        ]
+
+        try:
+            client.get_table(table_ref)
+        except NotFound:
+            table = bigquery.Table(table_ref, schema=target_schema)
+            table.time_partitioning = bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY)
+            client.create_table(table)
+            logging.info("Created missing table: %s.%s.%s", GCP_PROJECT_ID, BQ_DATASET, TRANSFORMED_BQ_TABLE)
         
-        job_config = bigquery.LoadJobConfig(
+        staging_table_name = f"{TRANSFORMED_BQ_TABLE}_staging"
+        staging_table_ref = client.dataset(BQ_DATASET).table(staging_table_name)
+
+        staging_load_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
             create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
             autodetect=True,
-            time_partitioning=bigquery.TimePartitioning(
-                type_=bigquery.TimePartitioningType.DAY,
-            ),
         )
         
         uri = f"gs://{GCS_BUCKET}/flight_metrics/ingestion_date={execution_date}/*.parquet"
-        table_ref = client.dataset(BQ_DATASET).table(TRANSFORMED_BQ_TABLE)
-        
+
         load_job = client.load_table_from_uri(
             uri,
-            table_ref,
-            job_config=job_config
+            staging_table_ref,
+            job_config=staging_load_config
         )
-        
+
         result = load_job.result()  # Wait for completion
+
+        merge_query = f"""
+            MERGE `{GCP_PROJECT_ID}.{BQ_DATASET}.{TRANSFORMED_BQ_TABLE}` T
+            USING (
+                SELECT
+                    icao24,
+                    ARRAY_AGG(
+                        STRUCT(
+                            origin_country,
+                            ingestion_date,
+                            altitude_km,
+                            speed_kmh
+                        )
+                        ORDER BY ingestion_date DESC
+                        LIMIT 1
+                    )[OFFSET(0)] AS latest
+                FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{staging_table_name}`
+                WHERE icao24 IS NOT NULL
+                GROUP BY icao24
+            ) S
+            ON T.icao24 = S.icao24
+            WHEN MATCHED THEN
+              UPDATE SET
+                origin_country = S.latest.origin_country,
+                ingestion_date = S.latest.ingestion_date,
+                altitude_km = S.latest.altitude_km,
+                speed_kmh = S.latest.speed_kmh
+            WHEN NOT MATCHED THEN
+              INSERT (icao24, origin_country, ingestion_date, altitude_km, speed_kmh)
+              VALUES (
+                S.icao24,
+                S.latest.origin_country,
+                S.latest.ingestion_date,
+                S.latest.altitude_km,
+                S.latest.speed_kmh
+              )
+        """
+
+        merge_job = client.query(merge_query)
+        merge_job.result()
+
+        dedupe_query = f"""
+            CREATE OR REPLACE TABLE `{GCP_PROJECT_ID}.{BQ_DATASET}.{TRANSFORMED_BQ_TABLE}`
+            PARTITION BY ingestion_date AS
+            SELECT
+                icao24,
+                origin_country,
+                ingestion_date,
+                altitude_km,
+                speed_kmh
+            FROM (
+                SELECT
+                    icao24,
+                    origin_country,
+                    ingestion_date,
+                    altitude_km,
+                    speed_kmh,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY icao24
+                        ORDER BY ingestion_date DESC
+                    ) AS rn
+                FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{TRANSFORMED_BQ_TABLE}`
+                WHERE icao24 IS NOT NULL
+            )
+            WHERE rn = 1
+        """
+
+        dedupe_job = client.query(dedupe_query)
+        dedupe_job.result()
         
         return {
             'rows_loaded': result.output_rows,
             'input_file_bytes': getattr(result, 'input_file_bytes', None),
             'input_files': getattr(result, 'input_files', None),
             'job_id': load_job.job_id,
+            'merge_job_id': merge_job.job_id,
+            'dedupe_job_id': dedupe_job.job_id,
             'table': f'{GCP_PROJECT_ID}.{BQ_DATASET}.{TRANSFORMED_BQ_TABLE}'
         }
     
